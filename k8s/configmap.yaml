@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secure-cicd-config
+  namespace: secure-cicd
+data:
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75.0"

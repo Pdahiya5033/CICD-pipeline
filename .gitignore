@@ -1,0 +1,10 @@
+target/
+*.log
+.env
+.env.*
+.idea/
+.vscode/
+.DS_Store
+kubeconfig
+*.pem
+*.key

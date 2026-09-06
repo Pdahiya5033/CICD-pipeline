@@ -1,0 +1,175 @@
+name: Secure Spring Boot WAR CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || 'springboot_sampleimage:latest' }}
+  K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE || 'secure-cicd' }}
+
+jobs:
+
+# build -> unit test -> sonarqube -> SAST -> dependency scan
+
+  build-test-sast:
+    name: Build, Test, SAST & Dependency Scan
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build and unit tests
+        working-directory: app
+        run: mvn -B clean verify
+
+      - name: SonarQube
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Semgrep SAST
+        uses: semgrep/semgrep-action@v1
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: secure-cicd-springboot-tomcat
+          path: .
+          format: HTML
+          out: dependency-check
+
+      - name: Upload dependency report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: dependency-check/
+
+
+  docker-build-scan:
+    name: Docker Build & Trivy Scan
+    needs: build-test-sast
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build multi-stage Tomcat image
+        run: |
+          docker build --pull \
+            -f docker/Dockerfile \
+            -t "${{ env.IMAGE_NAME }}" .
+
+      - name: Verify Docker image
+        run: |
+          docker image inspect "${{ env.IMAGE_NAME }}"
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}"
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Show local image
+        run: |
+          docker images "${{ env.IMAGE_NAME }}"
+
+
+  deploy:
+    name: Deploy to Local Kubernetes
+    needs: docker-build-scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Kubernetes context
+        run: |
+          kubectl config current-context
+          kubectl cluster-info
+
+      - name: Validate Kubernetes manifests
+        run: |
+          kubectl apply --dry-run=client -f k8s/
+
+      - name: Set local image
+        run: |
+          sed -i "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}|g" k8s/deployment.yaml
+
+      - name: Apply namespace
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+
+      - name: Apply ConfigMap
+        run: |
+          kubectl apply -f k8s/configmap.yaml
+
+      - name: Apply NetworkPolicy
+        run: |
+          kubectl apply -f k8s/networkpolicy.yaml
+
+      - name: Apply Service
+        run: |
+          kubectl apply -f k8s/service.yaml
+
+      - name: Apply Deployment
+        run: |
+          kubectl apply -f k8s/deployment.yaml
+
+      - name: Restart deployment with local image
+        run: |
+          kubectl -n "${K8S_NAMESPACE}" rollout restart deployment/secure-cicd-demo
+
+      - name: Wait for rollout
+        run: |
+          kubectl -n "${K8S_NAMESPACE}" rollout status \
+            deployment/secure-cicd-demo \
+            --timeout=180s
+
+      - name: Show deployment
+        run: |
+          kubectl -n "${K8S_NAMESPACE}" get pods -o wide
+          kubectl -n "${K8S_NAMESPACE}" get svc
+
+
+  dast:
+    name: DAST with OWASP ZAP
+    needs: deploy
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+
+    steps:
+      - name: Verify local application
+        run: |
+          echo "DAST target: ${{ vars.DAST_TARGET_URL }}"
+          test -n "${{ vars.DAST_TARGET_URL }}"
+
+      - name: OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: ${{ vars.DAST_TARGET_URL }}
+          fail_action: true
+
